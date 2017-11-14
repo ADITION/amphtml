@@ -14,41 +14,64 @@
  * limitations under the License.
  */
 
+import {Services} from '../services';
 import {dev, user} from '../log';
-import {getService} from '../service';
+import {registerServiceBuilder, getService} from '../service';
 import {
-  addParamToUrl,
   getSourceOrigin,
-  parseQueryString,
+  getCorsUrl,
+  getWinOrigin,
   parseUrl,
+  serializeQueryString,
 } from '../url';
-import {isArray, isObject} from '../types';
-
+import {parseJson} from '../json';
+import {isArray, isObject, isFormData} from '../types';
+import {utf8EncodeSync} from '../utils/bytes';
+import {getMode} from '../mode';
 
 /**
  * The "init" argument of the Fetch API. Currently, only "credentials: include"
- * is implemented.
+ * is implemented.  Note ampCors with explicit false indicates that
+ * __amp_source_origin should not be appended to the URL to allow for
+ * potential caching or response across pages.
  *
  * See https://developer.mozilla.org/en-US/docs/Web/API/GlobalFetch/fetch
  *
  * @typedef {{
- *   body: (!Object|!Array|undefined),
+ *   body: (!Object|!Array|undefined|string),
  *   credentials: (string|undefined),
  *   headers: (!Object|undefined),
  *   method: (string|undefined),
- *   requireAmpResponseSourceOrigin: (boolean|undefined)
+ *   requireAmpResponseSourceOrigin: (boolean|undefined),
+ *   ampCors: (boolean|undefined)
  * }}
  */
-let FetchInitDef;
+export let FetchInitDef;
+
+/**
+ * Special case for fetchJson
+ * @typedef {{
+ *   body: (!JsonObject|!FormData|undefined),
+ *   credentials: (string|undefined),
+ *   headers: (!Object|undefined),
+ *   method: (string|undefined),
+ *   requireAmpResponseSourceOrigin: (boolean|undefined),
+ *   ampCors: (boolean|undefined)
+ * }}
+ */
+export let FetchInitJsonDef;
 
 /** @private @const {!Array<string>} */
 const allowedMethods_ = ['GET', 'POST'];
 
-/** @private @const {!Array<function:boolean>} */
-const allowedBodyTypes_ = [isArray, isObject];
+/** @private @const {!Array<function(*):boolean>} */
+const allowedJsonBodyTypes_ = [isArray, isObject];
 
-/** @private @const {string} */
-const SOURCE_ORIGIN_PARAM = '__amp_source_origin';
+/** @private @enum {number} Allowed fetch responses. */
+const allowedFetchTypes_ = {
+  document: 1,
+  text: 2,
+};
 
 /** @private @const {string} */
 const ALLOW_SOURCE_ORIGIN_HEADER = 'AMP-Access-Control-Allow-Source-Origin';
@@ -56,8 +79,11 @@ const ALLOW_SOURCE_ORIGIN_HEADER = 'AMP-Access-Control-Allow-Source-Origin';
 
 /**
  * A service that polyfills Fetch API for use within AMP.
+ *
+ * @package Visible for type.
+ * @visibleForTesting
  */
-class Xhr {
+export class Xhr {
 
   /**
    * @param {!Window} win
@@ -65,6 +91,11 @@ class Xhr {
   constructor(win) {
     /** @const {!Window} */
     this.win = win;
+
+    const ampdocService = Services.ampdocServiceFor(win);
+    /** @private {?./ampdoc-impl.AmpDoc} */
+    this.ampdocSingle_ =
+        ampdocService.isSingleDoc() ? ampdocService.getAmpDoc() : null;
   }
 
   /**
@@ -72,68 +103,142 @@ class Xhr {
    * be either the native fetch or our polyfill.
    *
    * @param {string} input
-   * @param {?FetchInitDef=} opt_init
-   * @return {!Promise<!FetchResponse>}
+   * @param {!FetchInitDef} init
+   * @return {!Promise<!FetchResponse>|!Promise<!Response>}
    * @private
    */
-  fetch_(input, opt_init) {
+  fetch_(input, init) {
+    if (!getMode().test &&
+        this.ampdocSingle_ &&
+        Math.random() < 0.01 &&
+        parseUrl(input).origin != this.win.location.origin &&
+        !Services.viewerForDoc(this.ampdocSingle_).hasBeenVisible()) {
+      dev().error('XHR', 'attempted to fetch %s before viewer was visible',
+          input);
+    }
+
+    dev().assert(typeof input == 'string', 'Only URL supported: %s', input);
+    // In particular, Firefox does not tolerate `null` values for
+    // `credentials`.
+    const creds = init.credentials;
+    dev().assert(
+        creds === undefined || creds == 'include' || creds == 'omit',
+        'Only credentials=include|omit support: %s', creds);
     // Fallback to xhr polyfill since `fetch` api does not support
-    // responseType = 'document'. We do this so we dont have to do any parsing
+    // responseType = 'document'. We do this so we don't have to do any parsing
     // and document construction on the UI thread which would be expensive.
-    if (opt_init && opt_init.responseType == 'document') {
-      return fetchPolyfill.apply(null, arguments);
+    if (init.responseType == 'document') {
+      return fetchPolyfill(input, init);
     }
     return (this.win.fetch || fetchPolyfill).apply(null, arguments);
   }
 
   /**
-   * Performs the final initialization and requests the fetch. It does three
-   * main things: (1) It adds "__amp_source_origin" URL parameter with source
-   * origin; (2) It verifies "AMP-Access-Control-Allow-Source-Origin" if it's
-   * returned in the response; and (3) If requires
-   * "AMP-Access-Control-Allow-Source-Origin" to be present in the response
-   * if the `init.requireAmpResponseSourceOrigin = true`.
+   * Performs the final initialization and requests the fetch. It does two
+   * main things:
+   * - It adds "__amp_source_origin" URL parameter with source origin
+   * - It verifies "AMP-Access-Control-Allow-Source-Origin" in the response
+   * USE WITH CAUTION: setting ampCors to false disables AMP source origin check
+   * but allows for caching resources cross pages.
+   *
+   * Note: requireAmpResponseSourceOrigin is deprecated. It defaults to
+   *   true. Use "ampCors: false" to disable AMP source origin check.
    *
    * @param {string} input
-   * @param {?FetchInitDef=} opt_init
+   * @param {!FetchInitDef=} init
    * @return {!Promise<!FetchResponse>}
    * @private
    */
-  fetchAmpCors_(input, opt_init) {
-    // Add "__amp_source_origin" query parameter to the URL. Ideally, we'd be
-    // able to set a header (e.g. AMP-Source-Origin), but this will force
-    // preflight request on all CORS request.
-    const sourceOrigin = getSourceOrigin(this.win.location.href);
-    const url = parseUrl(input);
-    const query = parseQueryString(url.search);
-    user.assert(!(SOURCE_ORIGIN_PARAM in query),
-        'Source origin is not allowed in %s', input);
-    input = addParamToUrl(input, SOURCE_ORIGIN_PARAM, sourceOrigin);
-    return this.fetch_(input, opt_init).catch(reason => {
-      user.assert(false, 'Fetch failed %s: %s', input,
-          reason && reason.message);
-    }).then(response => {
+  fetchAmpCors_(input, init = {}) {
+    // Do not append __amp_source_origin if explicitly disabled.
+    if (init.ampCors !== false) {
+      input = this.getCorsUrl(this.win, input);
+    } else {
+      init.requireAmpResponseSourceOrigin = false;
+    }
+    if (init.requireAmpResponseSourceOrigin === true) {
+      dev().error('XHR',
+          'requireAmpResponseSourceOrigin is deprecated, use ampCors instead');
+    }
+    if (init.requireAmpResponseSourceOrigin === undefined) {
+      init.requireAmpResponseSourceOrigin = true;
+    }
+    // For some same origin requests, add AMP-Same-Origin: true header to allow
+    // publishers to validate that this request came from their own origin.
+    const currentOrigin = getWinOrigin(this.win);
+    const targetOrigin = parseUrl(input).origin;
+    if (currentOrigin == targetOrigin) {
+      init['headers'] = init['headers'] || {};
+      init['headers']['AMP-Same-Origin'] = 'true';
+    }
+    // In edge a `TypeMismatchError` is thrown when body is set to null.
+    dev().assert(init.body !== null, 'fetch `body` can not be `null`');
+    return this.fetch_(input, init).then(response => {
       const allowSourceOriginHeader = response.headers.get(
           ALLOW_SOURCE_ORIGIN_HEADER);
       if (allowSourceOriginHeader) {
+        const sourceOrigin = getSourceOrigin(this.win.location.href);
         // If the `AMP-Access-Control-Allow-Source-Origin` header is returned,
         // ensure that it's equal to the current source origin.
-        user.assert(allowSourceOriginHeader == sourceOrigin,
-              `Returned ${ALLOW_SOURCE_ORIGIN_HEADER} is not` +
+        user().assert(allowSourceOriginHeader == sourceOrigin,
+            `Returned ${ALLOW_SOURCE_ORIGIN_HEADER} is not` +
               ` equal to the current: ${allowSourceOriginHeader}` +
               ` vs ${sourceOrigin}`);
-      } else if (opt_init && opt_init.requireAmpResponseSourceOrigin) {
+      } else if (init.requireAmpResponseSourceOrigin) {
         // If the `AMP-Access-Control-Allow-Source-Origin` header is not
         // returned but required, return error.
-        user.assert(false, `Response must contain the` +
+        user().assert(false, 'Response must contain the' +
             ` ${ALLOW_SOURCE_ORIGIN_HEADER} header`);
       }
       return response;
+    }, reason => {
+      throw user().createExpectedError('XHR', 'Failed fetching' +
+          ` (${targetOrigin}/...):`, reason && reason.message);
     });
   }
 
   /**
-   * Fetches and constructs JSON object based on the fetch polyfill.
+   * Fetches a JSON response. Note this returns the response object, not the
+   * response's JSON. #fetchJson merely sets up the request to accept JSON.
+   *
+   * See https://developer.mozilla.org/en-US/docs/Web/API/GlobalFetch/fetch
+   *
+   * See `fetchAmpCors_` for more detail.
+   *
+   * @param {string} input
+   * @param {?FetchInitJsonDef=} opt_init
+   * @param {boolean=} opt_allowFailure Allows non-2XX status codes to fulfill.
+   * @return {!Promise<!FetchResponse>}
+   */
+  fetchJson(input, opt_init, opt_allowFailure) {
+    const init = setupInit(opt_init, 'application/json');
+    if (init.method == 'POST' && !isFormData(init.body)) {
+      // Assume JSON strict mode where only objects or arrays are allowed
+      // as body.
+      dev().assert(
+          allowedJsonBodyTypes_.some(test => test(init.body)),
+          'body must be of type object or array. %s',
+          init.body
+      );
+
+      // Content should be 'text/plain' to avoid CORS preflight.
+      init.headers['Content-Type'] = init.headers['Content-Type'] ||
+          'text/plain;charset=utf-8';
+      const headerContentType = init.headers['Content-Type'];
+      // Cast is valid, because we checked that it is not form data above.
+      if (headerContentType === 'application/x-www-form-urlencoded') {
+        init.body =
+          serializeQueryString(/** @type {!JsonObject} */ (init.body));
+      } else {
+        init.body = JSON.stringify(/** @type {!JsonObject} */ (init.body));
+      }
+    }
+    return this.fetch(input, init);
+  }
+
+  /**
+   * Fetches a text response. Note this returns the response object, not the
+   * response's text. #fetchText merely sets up the request to accept text.
    *
    * See https://developer.mozilla.org/en-US/docs/Web/API/GlobalFetch/fetch
    *
@@ -141,36 +246,38 @@ class Xhr {
    *
    * @param {string} input
    * @param {?FetchInitDef=} opt_init
-   * @return {!Promise<!JSONValue>}
+   * @return {!Promise<!FetchResponse>}
    */
-  fetchJson(input, opt_init) {
-    const init = opt_init || {};
-    init.method = normalizeMethod_(init.method);
-    setupJson_(init);
-
-    return this.fetchAmpCors_(input, init).then(response => {
-      return assertSuccess(response).json();
-    });
+  fetchText(input, opt_init) {
+    return this.fetch(input, setupInit(opt_init, 'text/plain'));
   }
 
   /**
    * Creates an XHR request with responseType=document
-   * and returns the `FetchResponse` object.
+   * and returns a promise for the initialized `Document`.
+   * Note this does not return a `Response`, since this is not a standard
+   * Fetch response type.
    *
    * @param {string} input
    * @param {?FetchInitDef=} opt_init
-   * @return {!Promise<!HTMLDocument>}
+   * @return {!Promise<!Document>}
    */
   fetchDocument(input, opt_init) {
-    const init = opt_init || {};
+    const init = setupInit(opt_init, 'text/html');
     init.responseType = 'document';
-    init.method = normalizeMethod_(init.method);
-    init.headers = init.headers || {};
-    init.headers['Accept'] = 'text/html';
+    return this.fetch(input, init)
+        .then(response => response.document_());
+  }
 
-    return this.fetchAmpCors_(input, init).then(response => {
-      return assertSuccess(response).document_();
-    });
+  /**
+   * @param {string} input URL
+   * @param {?FetchInitDef=} opt_init Fetch options object.
+   * @return {!Promise<!FetchResponse>}
+   */
+  fetch(input, opt_init) {
+    const init = setupInit(opt_init);
+    return this.fetchAmpCors_(input, init).then(response =>
+        assertSuccess(response));
   }
 
   /**
@@ -181,16 +288,26 @@ class Xhr {
    * See `fetchAmpCors_` for more detail.
    *
    * @param {string} input
-   * @param {?FetchInitDef=} opt_init
+   * @param {!FetchInitDef=} opt_init
    * @return {!Promise}
    */
   sendSignal(input, opt_init) {
-    return this.fetchAmpCors_(input, opt_init).then(response => {
-      assertSuccess(response);
-    });
+    return this.fetchAmpCors_(input, opt_init)
+        .then(response => assertSuccess(response));
+  }
+
+  /**
+   * Add "__amp_source_origin" query parameter to the URL. Ideally, we'd be
+   * able to set a header (e.g. AMP-Source-Origin), but this will force
+   * preflight request on all CORS request.
+   * @param {!Window} win
+   * @param {string} url
+   * @return {string}
+   */
+  getCorsUrl(win, url) {
+    return getCorsUrl(win, url);
   }
 }
-
 
 /**
  * Normalized method name by uppercasing.
@@ -198,43 +315,37 @@ class Xhr {
  * @return {string}
  * @private
  */
-export function normalizeMethod_(method) {
+function normalizeMethod_(method) {
   if (method === undefined) {
     return 'GET';
   }
   method = method.toUpperCase();
 
-  dev.assert(
-    allowedMethods_.indexOf(method) > -1,
-    'Only one of %s is currently allowed. Got %s',
-    allowedMethods_.join(', '),
-    method
+  dev().assert(
+      allowedMethods_.includes(method),
+      'Only one of %s is currently allowed. Got %s',
+      allowedMethods_.join(', '),
+      method
   );
 
   return method;
 }
 
 /**
-* Initialize init object with headers and stringifies the body.
- * @param {!FetchInitDef} init
- * @private
+ * Sets up and normalizes the FetchInitDef
+ *
+ * @param {?FetchInitDef=} opt_init Fetch options object.
+ * @param {string=} opt_accept The HTTP Accept header value.
+ * @return {!FetchInitDef}
  */
-function setupJson_(init) {
+function setupInit(opt_init, opt_accept) {
+  const init = opt_init || {};
+  init.method = normalizeMethod_(init.method);
   init.headers = init.headers || {};
-  init.headers['Accept'] = 'application/json';
-
-  if (init.method == 'POST') {
-    // Assume JSON strict mode where only objects or arrays are allowed
-    // as body.
-    dev.assert(
-      allowedBodyTypes_.some(test => test(init.body)),
-      'body must be of type object or array. %s',
-      init.body
-    );
-
-    init.headers['Content-Type'] = 'application/json;charset=utf-8';
-    init.body = JSON.stringify(init.body);
+  if (opt_accept) {
+    init.headers['Accept'] = opt_accept;
   }
+  return init;
 }
 
 
@@ -247,16 +358,11 @@ function setupJson_(init) {
  * us to immediately support a much wide API.
  *
  * @param {string} input
- * @param {!FetchInitDef=} opt_init
+ * @param {!FetchInitDef} init
  * @return {!Promise<!FetchResponse>}
  * @private Visible for testing
  */
-export function fetchPolyfill(input, opt_init) {
-  dev.assert(typeof input == 'string', 'Only URL supported: %s', input);
-  const init = opt_init || {};
-  dev.assert(!init.credentials || init.credentials == 'include',
-      'Only credentials=include support: %s', init.credentials);
-
+export function fetchPolyfill(input, init) {
   return new Promise(function(resolve, reject) {
     const xhr = createXhrRequest(init.method || 'GET', input);
 
@@ -264,8 +370,8 @@ export function fetchPolyfill(input, opt_init) {
       xhr.withCredentials = true;
     }
 
-    if (init.responseType == 'document') {
-      xhr.responseType = 'document';
+    if (init.responseType in allowedFetchTypes_) {
+      xhr.responseType = init.responseType;
     }
 
     if (init.headers) {
@@ -280,7 +386,7 @@ export function fetchPolyfill(input, opt_init) {
       }
       if (xhr.status < 100 || xhr.status > 599) {
         xhr.onreadystatechange = null;
-        reject(new Error(`Unknown HTTP status ${xhr.status}`));
+        reject(user().createExpectedError(`Unknown HTTP status ${xhr.status}`));
         return;
       }
 
@@ -292,10 +398,10 @@ export function fetchPolyfill(input, opt_init) {
       }
     };
     xhr.onerror = () => {
-      reject(new Error('Network failure'));
+      reject(user().createExpectedError('Network failure'));
     };
     xhr.onabort = () => {
-      reject(new Error('Request aborted'));
+      reject(user().createExpectedError('Request aborted'));
     };
 
     if (init.method == 'POST') {
@@ -306,11 +412,10 @@ export function fetchPolyfill(input, opt_init) {
   });
 }
 
-
 /**
  * @param {string} method
  * @param {string} url
- * @return {!XMLHttpRequest}
+ * @return {!XMLHttpRequest|!XDomainRequest}
  * @private
  */
 function createXhrRequest(method, url) {
@@ -322,14 +427,14 @@ function createXhrRequest(method, url) {
     xhr = new XDomainRequest();
     xhr.open(method, url);
   } else {
-    throw new Error('CORS is not supported');
+    throw dev().createExpectedError('CORS is not supported');
   }
   return xhr;
 }
 
 /**
  * If 415 or in the 5xx range.
- * @param {string} status
+ * @param {number} status
  */
 function isRetriable(status) {
   return status == 415 || (status >= 500 && status < 600);
@@ -338,18 +443,24 @@ function isRetriable(status) {
 
 /**
  * Returns the response if successful or otherwise throws an error.
- * @paran {!FetchResponse} response
- * @return {!FetchResponse}
+ * @param {!FetchResponse} response
+ * @return {!Promise<!FetchResponse>}
+ * @private Visible for testing
  */
-function assertSuccess(response) {
-  if (!(response.status >= 200 && response.status < 300)) {
-    const err = user.createError(`HTTP error ${response.status}`);
-    if (isRetriable(response.status)) {
-      err.retriable = true;
+export function assertSuccess(response) {
+  return new Promise(resolve => {
+    if (response.ok) {
+      return resolve(response);
     }
+
+    const {status} = response;
+    const err = user().createError(`HTTP error ${status}`);
+    err.retriable = isRetriable(status);
+    // TODO(@jridgewell, #9448): Callers who need the response should
+    // skip processing.
+    err.response = response;
     throw err;
-  }
-  return response;
+  });
 }
 
 
@@ -360,20 +471,35 @@ function assertSuccess(response) {
  */
 export class FetchResponse {
   /**
-   * @param {!XMLHttpRequest} xhr
+   * @param {!XMLHttpRequest|!XDomainRequest} xhr
    */
   constructor(xhr) {
-    /** @private @const {!XMLHttpRequest} */
+    /** @private @const {!XMLHttpRequest|!XDomainRequest} */
     this.xhr_ = xhr;
 
-    /** @type {number} */
+    /** @const {number} */
     this.status = this.xhr_.status;
 
-    /** @private @const {!FetchResponseHeaders} */
+    /** @const {boolean} */
+    this.ok = this.status >= 200 && this.status < 300;
+
+    /** @const {!FetchResponseHeaders} */
     this.headers = new FetchResponseHeaders(xhr);
 
     /** @type {boolean} */
     this.bodyUsed = false;
+
+    /** @type {?ReadableStream} */
+    this.body = null;
+  }
+
+  /**
+   * Create a copy of the response and return it.
+   * @return {!FetchResponse}
+   */
+  clone() {
+    dev().assert(!this.bodyUsed, 'Body already used');
+    return new FetchResponse(this.xhr_);
   }
 
   /**
@@ -382,7 +508,7 @@ export class FetchResponse {
    * @private
    */
   drainText_() {
-    dev.assert(!this.bodyUsed, 'Body already used');
+    dev().assert(!this.bodyUsed, 'Body already used');
     this.bodyUsed = true;
     return Promise.resolve(this.xhr_.responseText);
   }
@@ -398,45 +524,67 @@ export class FetchResponse {
 
   /**
    * Drains the response and returns the JSON object.
-   * @return {!Promise<!JSONValue>}
+   * @return {!Promise<!JsonObject>}
    */
   json() {
-    return this.drainText_().then(JSON.parse);
+    return /** @type {!Promise<!JsonObject>} */ (
+        this.drainText_().then(parseJson));
   }
 
   /**
    * Reads the xhr responseXML.
-   * @return {!Promise<!HTMLDocument>}
+   * @return {!Promise<!Document>}
    * @private
    */
   document_() {
-    dev.assert(!this.bodyUsed, 'Body already used');
+    dev().assert(!this.bodyUsed, 'Body already used');
     this.bodyUsed = true;
-    user.assert(this.xhr_.responseXML instanceof Document,
-        'responseXML should be a Document instance.');
-    return Promise.resolve(this.xhr_.responseXML);
+    user().assert(this.xhr_.responseXML,
+        'responseXML should exist. Make sure to return ' +
+        'Content-Type: text/html header.');
+    return /** @type {!Promise<!Document>} */ (
+        Promise.resolve(dev().assert(this.xhr_.responseXML)));
+  }
+
+  /**
+   * Drains the response and returns a promise that resolves with the response
+   * ArrayBuffer.
+   * @return {!Promise<!ArrayBuffer>}
+   */
+  arrayBuffer() {
+    return /** @type {!Promise<!ArrayBuffer>} */ (
+        this.drainText_().then(utf8EncodeSync));
   }
 }
 
 
 /**
  * Provides access to the response headers as defined in the Fetch API.
+ * @private Visible for testing.
  */
-class FetchResponseHeaders {
+export class FetchResponseHeaders {
   /**
-   * @param {!XMLHttpRequest} xhr
+   * @param {!XMLHttpRequest|!XDomainRequest} xhr
    */
   constructor(xhr) {
-    /** @private @const {!XMLHttpRequest} */
+    /** @private @const {!XMLHttpRequest|!XDomainRequest} */
     this.xhr_ = xhr;
   }
 
   /**
    * @param {string} name
-   * @return {*}
+   * @return {string}
    */
   get(name) {
     return this.xhr_.getResponseHeader(name);
+  }
+
+  /**
+   * @param {string} name
+   * @return {boolean}
+   */
+  has(name) {
+    return this.xhr_.getResponseHeader(name) != null;
   }
 }
 
@@ -445,8 +593,14 @@ class FetchResponseHeaders {
  * @param {!Window} window
  * @return {!Xhr}
  */
+export function xhrServiceForTesting(window) {
+  installXhrService(window);
+  return getService(window, 'xhr');
+}
+
+/**
+ * @param {!Window} window
+ */
 export function installXhrService(window) {
-  return getService(window, 'xhr', () => {
-    return new Xhr(window);
-  });
+  registerServiceBuilder(window, 'xhr', Xhr);
 };

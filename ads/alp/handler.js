@@ -18,9 +18,12 @@ import {
   addParamToUrl,
   parseQueryString,
 } from '../../src/url';
-import {closest} from '../../src/dom';
-
-
+import {closest, openWindowDialog} from '../../src/dom';
+import {dev} from '../../src/log';
+import {dict} from '../../src/utils/object';
+import {urls} from '../../src/config';
+import {isProxyOrigin, isLocalhostOrigin, parseUrl} from '../../src/url';
+import {startsWith} from '../../src/string';
 
 /**
  * Install a click listener that transforms navigation to the AMP cache
@@ -41,10 +44,11 @@ export function installAlpClickHandler(win) {
 /**
  * Filter click event and then transform URL for direct AMP navigation
  * with impression logging.
- * @param {!MouseEvent} e
+ * @param {!Event} e
+ * @param {function(string)=} opt_viewerNavigate
  * @visibleForTesting
  */
-export function handleClick(e) {
+export function handleClick(e, opt_viewerNavigate) {
   if (e.defaultPrevented) {
     return;
   }
@@ -61,11 +65,14 @@ export function handleClick(e) {
   if (!link || !link.eventualUrl) {
     return;
   }
+  if (e.isTrusted === false) {
+    return;
+  }
 
   // Tag the original href with &amp=1 and make it a fragment param with
   // name click.
   const fragment = 'click=' + encodeURIComponent(
-      addParamToUrl(link.a.href, 'amp', '1'));
+      addParamToUrl(link.a.href, 'amp', '1', /* opt_addToFront */ true));
   let destination = link.eventualUrl;
   if (link.eventualUrl.indexOf('#') == -1) {
     destination += '#' + fragment;
@@ -75,12 +82,19 @@ export function handleClick(e) {
   const win = link.a.ownerDocument.defaultView;
   const ancestors = win.location.ancestorOrigins;
   if (ancestors && ancestors[ancestors.length - 1] == 'http://localhost:8000') {
-    destination = destination.replace('https://cdn.ampproject.org/c/',
+    destination = destination.replace(
+        `${parseUrl(link.eventualUrl).host}/c/`,
         'http://localhost:8000/max/');
   }
-
   e.preventDefault();
-  navigateTo(win, link.a, destination);
+  if (opt_viewerNavigate) {
+    // TODO: viewer navigate only support navigating top level window to
+    // destination. should we try to open a new window here with target=_blank
+    // here instead of using viewer navigation.
+    opt_viewerNavigate(destination);
+  } else {
+    navigateTo(win, link.a, destination);
+  }
 }
 
 /**
@@ -94,7 +108,7 @@ export function handleClick(e) {
  * }|undefined} A URL on the AMP Cache.
  */
 function getLinkInfo(e) {
-  const a = closest(e.target, element => {
+  const a = closest(dev().assertElement(e.target), element => {
     return element.tagName == 'A' && element.href;
   });
   if (!a) {
@@ -118,7 +132,8 @@ function getEventualUrl(a) {
   if (!eventualUrl) {
     return;
   }
-  if (!eventualUrl.indexOf('https://cdn.ampproject.org/c/') == 0) {
+  if (!isProxyOrigin(eventualUrl) ||
+      !startsWith(parseUrl(eventualUrl).pathname, '/c/')) {
     return;
   }
   return eventualUrl;
@@ -133,7 +148,14 @@ function getEventualUrl(a) {
  */
 function navigateTo(win, a, url) {
   const target = (a.target || '_top').toLowerCase();
-  win.open(url, target);
+  const a2aAncestor = getA2AAncestor(win);
+  if (a2aAncestor) {
+    a2aAncestor.win./*OK*/postMessage('a2a;' + JSON.stringify(dict({
+      'url': url,
+    })), a2aAncestor.origin);
+    return;
+  }
+  openWindowDialog(win, url, target);
 }
 
 /**
@@ -145,13 +167,12 @@ export function warmupStatic(win) {
   // Preconnect using an image, because that works on all browsers.
   // The image has a 1 minute cache time to avoid duplicate
   // preconnects.
-  new win.Image().src = 'https://cdn.ampproject.org/preconnect.gif';
+  new win.Image().src = `${urls.cdn}/preconnect.gif`;
   // Preload the primary AMP JS that is render blocking.
   const linkRel = /*OK*/document.createElement('link');
   linkRel.rel = 'preload';
   linkRel.setAttribute('as', 'script');
-  linkRel.href =
-      'https://cdn.ampproject.org/rtv/01$internalRuntimeVersion$/v0.js';
+  linkRel.href = `${urls.cdn}/v0.js`;
   getHeadOrFallback(win.document).appendChild(linkRel);
 }
 
@@ -166,11 +187,19 @@ export function warmupDynamic(e) {
   if (!link || !link.eventualUrl) {
     return;
   }
-  const linkRel = /*OK*/document.createElement('link');
-  linkRel.rel = 'preload';
-  linkRel.setAttribute('as', 'document');
-  linkRel.href = link.eventualUrl;
-  getHeadOrFallback(e.target.ownerDocument).appendChild(linkRel);
+  // Preloading with empty as and newly specced value `fetch` meaning the same
+  // thing. `document` would be the right value, but this is not yet supported
+  // in browsers.
+  const linkRel0 = /*OK*/document.createElement('link');
+  linkRel0.rel = 'preload';
+  linkRel0.href = link.eventualUrl;
+  const linkRel1 = /*OK*/document.createElement('link');
+  linkRel1.rel = 'preload';
+  linkRel1.as = 'fetch';
+  linkRel1.href = link.eventualUrl;
+  const head = getHeadOrFallback(e.target.ownerDocument);
+  head.appendChild(linkRel0);
+  head.appendChild(linkRel1);
 }
 
 /**
@@ -180,4 +209,52 @@ export function warmupDynamic(e) {
  */
 function getHeadOrFallback(doc) {
   return doc.head || doc.documentElement;
+}
+
+/**
+ * Returns info about an ancestor that can perform A2A navigations
+ * or null if none is present.
+ * @param {!Window} win
+ * @return {?{
+ *   win: !Window,
+ *   origin: string,
+ * }}
+ */
+export function getA2AAncestor(win) {
+  if (!win.location.ancestorOrigins) {
+    return null;
+  }
+  const origins = win.location.ancestorOrigins;
+  // We expect top, amp cache, ad (can be nested).
+  if (origins.length < 2) {
+    return null;
+  }
+  const top = origins[origins.length - 1];
+  // Not a security property. We just check whether the
+  // viewer might support A2A. More domains can be added to whitelist
+  // as needed.
+  if (top.indexOf('.google.') == -1) {
+    return null;
+  }
+  const amp = origins[origins.length - 2];
+  if (!isProxyOrigin(amp) && !isLocalhostOrigin(amp)) {
+    return null;
+  }
+  return {
+    win: getNthParentWindow(win, origins.length - 1),
+    origin: amp,
+  };
+}
+
+/**
+ * Returns the Nth parent of the given window.
+ * @param {!Window} win
+ * @param {number} distance frames above us.
+ */
+function getNthParentWindow(win, distance) {
+  let parent = win;
+  for (let i = 0; i < distance; i++) {
+    parent = parent.parent;
+  }
+  return parent;
 }

@@ -14,18 +14,25 @@
  * limitations under the License.
  */
 
-import {checkData} from '../../src/3p';
+import {validateData} from '../../3p/3p';
+import {setStyles} from '../../src/style';
+import {camelCaseToDash} from '../../src/string';
 
 /**
+ * Make an adsense iframe.
  * @param {!Window} global
  * @param {!Object} data
  */
 export function adsense(global, data) {
-  checkData(data, ['adClient', 'adSlot']);
+  // TODO: check mandatory fields
+  validateData(data, [],
+      ['adClient', 'adSlot', 'adHost', 'adtest', 'tagOrigin', 'experimentId',
+        'ampSlotIndex', 'adChannel', 'autoFormat']);
+
   if (global.context.clientId) {
     // Read by GPT for GA/GPT integration.
     global.gaGlobal = {
-      vid: global.context.clientId,
+      cid: global.context.clientId,
       hid: global.context.pageViewId,
     };
   }
@@ -34,13 +41,30 @@ export function adsense(global, data) {
   global.document.body.appendChild(s);
 
   const i = global.document.createElement('ins');
-  i.setAttribute('data-ad-client', data['adClient']);
-  if (data['adSlot']) {
-    i.setAttribute('data-ad-slot', data['adSlot']);
-  }
+  ['adChannel', 'adClient', 'adSlot', 'adHost', 'adtest', 'tagOrigin']
+      .forEach(datum => {
+        if (data[datum]) {
+          i.setAttribute('data-' + camelCaseToDash(datum), data[datum]);
+        }
+      });
   i.setAttribute('data-page-url', global.context.canonicalUrl);
   i.setAttribute('class', 'adsbygoogle');
-  i.style.cssText = 'display:inline-block;width:100%;height:100%;';
+  setStyles(i, {
+    display: 'inline-block',
+    width: '100%',
+    height: '100%',
+  });
+  const initializer = {};
+  if (data['experimentId']) {
+    const experimentIdList = data['experimentId'].split(',');
+    if (experimentIdList) {
+      initializer['params'] = {
+        'google_ad_modifications': {
+          'eids': experimentIdList,
+        },
+      };
+    }
+  }
   global.document.getElementById('c').appendChild(i);
-  (global.adsbygoogle = global.adsbygoogle || []).push({});
+  (global.adsbygoogle = global.adsbygoogle || []).push(initializer);
 }
